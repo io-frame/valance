@@ -17,15 +17,16 @@ class HistoryScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final operations = store.operations;
+    final groups = store.operationGroups;
     final children = <Widget>[];
     DateTime? currentDate;
-    for (final operation in operations) {
-      if (currentDate == null || !_sameDay(currentDate, operation.occurredAt)) {
-        currentDate = operation.occurredAt;
+    for (final group in groups) {
+      final source = group.source;
+      if (currentDate == null || !_sameDay(currentDate, source.occurredAt)) {
+        currentDate = source.occurredAt;
         children.add(_DateGroupHeader(date: currentDate));
       }
-      children.add(_OperationTile(store: store, operation: operation));
+      children.add(_OperationTile(store: store, group: group));
     }
     return ScreenScaffold(
       title: 'Операции',
@@ -55,7 +56,7 @@ class HistoryScreen extends StatelessWidget {
         ],
       ),
       children: [
-        if (operations.isEmpty)
+        if (groups.isEmpty)
           _EmptyHistoryCard(onAdd: () => _showOperationSheet(context, store))
         else
           ...children,
@@ -85,13 +86,15 @@ class _DateGroupHeader extends StatelessWidget {
 }
 
 class _OperationTile extends StatelessWidget {
-  const _OperationTile({required this.store, required this.operation});
+  const _OperationTile({required this.store, required this.group});
 
   final ValanceStore store;
-  final WalletOperation operation;
+  final WalletOperationGroup group;
 
   @override
   Widget build(BuildContext context) {
+    final operation = group.netOperation;
+    final source = group.source;
     final warning = FxEngine.operationRateWarning(
       operation: operation,
       rates: store.rates,
@@ -107,7 +110,7 @@ class _OperationTile extends StatelessWidget {
                 child: InkWell(
                   borderRadius: BorderRadius.circular(8),
                   onTap: () =>
-                      _showOperationSheet(context, store, existing: operation),
+                      _showOperationSheet(context, store, existing: source),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(vertical: 4),
                     child: Column(
@@ -126,12 +129,20 @@ class _OperationTile extends StatelessWidget {
                           crossAxisAlignment: WrapCrossAlignment.center,
                           children: [
                             Text(
-                              'операция от ${appDate(operation.occurredAt)}',
+                              'операция от ${appDate(source.occurredAt)}',
                               style: Theme.of(context).textTheme.bodySmall
                                   ?.copyWith(
                                     color: Colors.black.withValues(alpha: 0.56),
                                   ),
                             ),
+                            if (group.hasAdjustments)
+                              Text(
+                                'нетто после корректировок',
+                                style: Theme.of(context).textTheme.bodySmall
+                                    ?.copyWith(
+                                      color: Colors.black.withValues(alpha: 0.56),
+                                    ),
+                              ),
                             if (warning != null) _AnomalyBadge(warning: warning),
                           ],
                         ),
@@ -144,13 +155,16 @@ class _OperationTile extends StatelessWidget {
                 tooltip: 'Действия с операцией',
                 onSelected: (value) {
                   if (value == 'edit') {
-                    _showOperationSheet(context, store, existing: operation);
+                    _showOperationSheet(context, store, existing: source);
+                  } else if (value == 'adjust') {
+                    _showAdjustmentSheet(context, store, source: source);
                   } else if (value == 'delete') {
-                    _confirmDelete(context, store, operation);
+                    _confirmDelete(context, store, source);
                   }
                 },
                 itemBuilder: (context) => const [
                   PopupMenuItem(value: 'edit', child: Text('Редактировать')),
+                  PopupMenuItem(value: 'adjust', child: Text('Уменьшить')),
                   PopupMenuItem(value: 'delete', child: Text('Удалить')),
                 ],
               ),
@@ -164,13 +178,79 @@ class _OperationTile extends StatelessWidget {
               title: const Text('Курс операции'),
               children: [
                 _RateDetails(operation: operation, warning: warning, store: store),
-                if (operation.comment.trim().isNotEmpty)
-                  _DetailRow(label: 'Комментарий', value: operation.comment),
+                if (group.hasAdjustments) ...[
+                  _DetailRow(
+                    label: 'Исходно',
+                    value:
+                        '${_historyMoney(source.fromAmount, source.fromCurrency)} → '
+                        '${_historyMoney(source.toAmount, source.toCurrency)}',
+                  ),
+                  _AdjustmentList(
+                    store: store,
+                    source: source,
+                    adjustments: group.adjustments,
+                  ),
+                ],
+                if (source.comment.trim().isNotEmpty)
+                  _DetailRow(label: 'Комментарий', value: source.comment),
               ],
             ),
           ),
         ],
       ),
+    );
+  }
+}
+
+class _AdjustmentList extends StatelessWidget {
+  const _AdjustmentList({
+    required this.store,
+    required this.source,
+    required this.adjustments,
+  });
+
+  final ValanceStore store;
+  final WalletOperation source;
+  final List<WalletOperation> adjustments;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        for (final adjustment in adjustments)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    'Убрано ${_historyMoney(adjustment.fromAmount, adjustment.fromCurrency)} '
+                    '(${_historyMoney(adjustment.toAmount, adjustment.toCurrency)})',
+                    style: TextStyle(
+                      color: Colors.black.withValues(alpha: 0.7),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Редактировать корректировку',
+                  onPressed: () => _showAdjustmentSheet(
+                    context,
+                    store,
+                    source: source,
+                    adjustment: adjustment,
+                  ),
+                  icon: const Icon(Icons.edit_outlined),
+                ),
+                IconButton(
+                  tooltip: 'Удалить корректировку',
+                  onPressed: () =>
+                      _confirmDeleteAdjustment(context, store, adjustment),
+                  icon: const Icon(Icons.delete_outline),
+                ),
+              ],
+            ),
+          ),
+      ],
     );
   }
 }
@@ -282,6 +362,10 @@ Future<void> _showOperationSheet(
                   rates: store.rates,
                 )
               : null;
+          final canAdjustSource = existing != null && !existing.isAdjustment;
+          final hasUnsavedChanges = existing == null
+              ? false
+              : canAdjustSource && !_sameOperationInput(existing, draft);
 
           Future<void> save() async {
             final operation = draftOperation();
@@ -404,6 +488,30 @@ Future<void> _showOperationSheet(
                             warning: previewWarning,
                           ),
                         ],
+                        if (canAdjustSource) ...[
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            child: OutlinedButton.icon(
+                              onPressed: hasUnsavedChanges
+                                  ? null
+                                  : () async {
+                                      await _showAdjustmentSheet(
+                                        context,
+                                        store,
+                                        source: existing!,
+                                      );
+                                      if (context.mounted) setState(() {});
+                                    },
+                              icon: const Icon(Icons.remove_circle_outline),
+                              label: Text(
+                                hasUnsavedChanges
+                                    ? 'Сначала сохраните изменения'
+                                    : 'Уменьшить пропорционально',
+                              ),
+                            ),
+                          ),
+                        ],
                         if (error != null) ...[
                           const SizedBox(height: 12),
                           _WarningStrip(text: error!),
@@ -427,6 +535,185 @@ Future<void> _showOperationSheet(
   fromAmount.dispose();
   toAmount.dispose();
   comment.dispose();
+}
+
+Future<void> _showAdjustmentSheet(
+  BuildContext context,
+  ValanceStore store, {
+  required WalletOperation source,
+  WalletOperation? adjustment,
+}) async {
+  final amount = TextEditingController(
+    text: adjustment == null ? '' : _inputNumber(adjustment.fromAmount),
+  );
+  var currency = adjustment?.fromCurrency ?? source.toCurrency;
+  String? error;
+
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    builder: (context) {
+      return StatefulBuilder(
+        builder: (context, setState) {
+          final removedAmount = parseLocalizedNumber(amount.text) ?? 0;
+          WalletOperation? draft;
+          WalletOperationGroup? preview;
+          String? previewError;
+          try {
+            final draftAdjustment = FxEngine.buildProportionalAdjustment(
+              id: adjustment?.id,
+              source: source,
+              removedCurrency: currency,
+              removedAmount: removedAmount,
+              occurredAt: adjustment?.occurredAt ??
+                  source.occurredAt.add(const Duration(microseconds: 1)),
+            );
+            draft = draftAdjustment;
+            final previewGroup = FxEngine.groupAfterAdjustment(
+              source: source,
+              adjustments: store.operations
+                  .where((item) => item.adjustmentSourceId == source.id)
+                  .toList(growable: false),
+              adjustment: draftAdjustment,
+            );
+            preview = previewGroup;
+            if (previewGroup.netFromAmount <= FxEngine.tolerance ||
+                previewGroup.netToAmount <= FxEngine.tolerance) {
+              previewError = 'Корректировка полностью убирает операцию.';
+            }
+          } on StateError catch (stateError) {
+            previewError = stateError.message;
+          }
+          final canSave = draft != null && previewError == null;
+
+          Future<void> save() async {
+            final result = await store.upsertProportionalAdjustment(
+              adjustmentId: adjustment?.id,
+              sourceId: source.id,
+              removedCurrency: currency,
+              removedAmount: removedAmount,
+            );
+            if (result == null && context.mounted) {
+              Navigator.of(context).pop();
+            } else {
+              setState(() => error = result);
+            }
+          }
+
+          return Padding(
+            padding: EdgeInsets.only(
+              left: 16,
+              right: 16,
+              top: 18,
+              bottom: MediaQuery.of(context).viewInsets.bottom +
+                  MediaQuery.of(context).padding.bottom +
+                  16,
+            ),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SectionTitle(
+                    adjustment == null
+                        ? 'Уменьшить операцию'
+                        : 'Редактировать корректировку',
+                  ),
+                  const SizedBox(height: 12),
+                  _DetailRow(
+                    label: 'Исходно',
+                    value:
+                        '${_historyMoney(source.fromAmount, source.fromCurrency)} → '
+                        '${_historyMoney(source.toAmount, source.toCurrency)}',
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      SizedBox(
+                        width: 112,
+                        child: DropdownButtonFormField<Currency>(
+                          initialValue: currency,
+                          decoration: const InputDecoration(
+                            border: OutlineInputBorder(),
+                            contentPadding: EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 12,
+                            ),
+                          ),
+                          items: [
+                            for (final value in [
+                              source.fromCurrency,
+                              source.toCurrency,
+                            ])
+                              DropdownMenuItem(
+                                value: value,
+                                child: Text(value.code),
+                              ),
+                          ],
+                          onChanged: (value) {
+                            if (value == null) return;
+                            setState(() => currency = value);
+                          },
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: TextField(
+                          controller: amount,
+                          inputFormatters: const [
+                            LocalizedDecimalInputFormatter(),
+                          ],
+                          keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true,
+                          ),
+                          onChanged: (_) => setState(() {}),
+                          decoration: const InputDecoration(
+                            labelText: 'Сколько убрать',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (draft != null && preview != null) ...[
+                    const SizedBox(height: 10),
+                    _OperationPreview(
+                      operation: draft,
+                      warning: null,
+                    ),
+                    const SizedBox(height: 8),
+                    _WarningStrip(
+                      text:
+                          'Нетто: ${_historyMoney(preview.netFromAmount, source.fromCurrency)} → '
+                          '${_historyMoney(preview.netToAmount, source.toCurrency)}',
+                    ),
+                  ],
+                  if (previewError != null) ...[
+                    const SizedBox(height: 10),
+                    _WarningStrip(text: previewError),
+                  ],
+                  if (error != null) ...[
+                    const SizedBox(height: 10),
+                    _WarningStrip(text: error!),
+                  ],
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton(
+                      onPressed: canSave ? save : null,
+                      child: const Text('Сохранить корректировку'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    },
+  );
+  amount.dispose();
 }
 
 class _CurrencyAmountRow extends StatelessWidget {
@@ -531,12 +818,14 @@ Future<void> _confirmDelete(
   ValanceStore store,
   WalletOperation operation,
 ) async {
+  final deleteTargets = _deleteTargets(store, operation);
+  final deleteIds = deleteTargets.map((item) => item.id).toSet();
   final before = _portfolioResultRub(
     operations: store.operations,
     wallet: store.wallet,
   );
   final nextOperations = store.operations
-      .where((item) => item.id != operation.id)
+      .where((item) => !deleteIds.contains(item.id))
       .toList(growable: false);
   final ledgerError = FxEngine.validateLedger(nextOperations);
   final nextWallet = ledgerError == null
@@ -555,7 +844,8 @@ Future<void> _confirmDelete(
       title: const Text('Удалить операцию?'),
       content: Text(
         ledgerError == null
-            ? 'После удаления пересчитается вся история. '
+            ? '${deleteTargets.length > 1 ? 'Будут удалены операция и корректировки. ' : ''}'
+                  'После удаления пересчитается вся история. '
                   'Результат изменится с ${_nullableRub(before)} '
                   'на ${_nullableRub(after)}.'
             : 'После удаления история станет некорректной: $ledgerError',
@@ -575,7 +865,6 @@ Future<void> _confirmDelete(
     ),
   );
   if (confirmed == true && context.mounted) {
-    final deleted = operation;
     final error = await store.deleteOperation(operation.id);
     if (!context.mounted) return;
     if (error != null) {
@@ -586,7 +875,48 @@ Future<void> _confirmDelete(
           content: const Text('Операция удалена'),
           action: SnackBarAction(
             label: 'Отменить',
-            onPressed: () => store.upsertOperation(deleted),
+            onPressed: () => store.restoreOperations(deleteTargets),
+          ),
+        ),
+      );
+    }
+  }
+}
+
+Future<void> _confirmDeleteAdjustment(
+  BuildContext context,
+  ValanceStore store,
+  WalletOperation adjustment,
+) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('Удалить корректировку?'),
+      content: const Text('После удаления нетто операции пересчитается.'),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Отмена'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: const Text('Удалить'),
+        ),
+      ],
+    ),
+  );
+  if (confirmed == true && context.mounted) {
+    final error = await store.deleteOperation(adjustment.id);
+    if (!context.mounted) return;
+    if (error != null) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error)));
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Корректировка удалена'),
+          action: SnackBarAction(
+            label: 'Отменить',
+            onPressed: () => store.restoreOperations([adjustment]),
           ),
         ),
       );
@@ -926,6 +1256,27 @@ double? _portfolioResultRub({
   final current = wallet.totalCurrentRubValue;
   if (current == null) return null;
   return current - FxEngine.netRubSpent(operations);
+}
+
+List<WalletOperation> _deleteTargets(
+  ValanceStore store,
+  WalletOperation operation,
+) {
+  if (operation.isAdjustment) return [operation];
+  return [
+    for (final item in store.operations)
+      if (item.id == operation.id || item.adjustmentSourceId == operation.id)
+        item,
+  ];
+}
+
+bool _sameOperationInput(WalletOperation a, WalletOperation b) {
+  return a.occurredAt == b.occurredAt &&
+      a.fromCurrency == b.fromCurrency &&
+      (a.fromAmount - b.fromAmount).abs() <= FxEngine.tolerance &&
+      a.toCurrency == b.toCurrency &&
+      (a.toAmount - b.toAmount).abs() <= FxEngine.tolerance &&
+      a.comment == b.comment;
 }
 
 bool _sameDay(DateTime a, DateTime b) {
