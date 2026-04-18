@@ -28,11 +28,85 @@ class FxEngine {
 
   static String? validateLedger(List<WalletOperation> operations) {
     try {
+      _validateAdjustmentLinks(operations);
       calculatePositionStates(operations);
       return null;
     } on StateError catch (error) {
       return error.message;
     }
+  }
+
+  static List<WalletOperationGroup> groupOperations(
+    List<WalletOperation> operations,
+  ) {
+    final adjustmentsBySource = <String, List<WalletOperation>>{};
+    final sources = <WalletOperation>[];
+    for (final operation in sortOperations(operations)) {
+      final sourceId = operation.adjustmentSourceId;
+      if (sourceId == null) {
+        sources.add(operation);
+      } else {
+        adjustmentsBySource.putIfAbsent(sourceId, () => []).add(operation);
+      }
+    }
+
+    return [
+      for (final source in sources)
+        _buildGroup(source, adjustmentsBySource[source.id] ?? const []),
+    ];
+  }
+
+  static WalletOperation buildProportionalAdjustment({
+    String? id,
+    required WalletOperation source,
+    required Currency removedCurrency,
+    required double removedAmount,
+    required DateTime occurredAt,
+  }) {
+    if (source.isAdjustment) {
+      throw StateError('Корректировка не может быть источником.');
+    }
+    if (!_isPositiveFinite(removedAmount)) {
+      throw StateError('Сумма корректировки должна быть положительной.');
+    }
+    if (removedCurrency == source.toCurrency) {
+      return WalletOperation(
+        id: id,
+        occurredAt: occurredAt,
+        fromCurrency: source.toCurrency,
+        fromAmount: removedAmount,
+        toCurrency: source.fromCurrency,
+        toAmount: removedAmount * source.fromAmount / source.toAmount,
+        adjustmentSourceId: source.id,
+      );
+    }
+    if (removedCurrency == source.fromCurrency) {
+      return WalletOperation(
+        id: id,
+        occurredAt: occurredAt,
+        fromCurrency: source.toCurrency,
+        fromAmount: removedAmount * source.toAmount / source.fromAmount,
+        toCurrency: source.fromCurrency,
+        toAmount: removedAmount,
+        adjustmentSourceId: source.id,
+      );
+    }
+    throw StateError('Можно убрать только валюты исходной операции.');
+  }
+
+  static WalletOperationGroup groupAfterAdjustment({
+    required WalletOperation source,
+    required List<WalletOperation> adjustments,
+    required WalletOperation adjustment,
+  }) {
+    return _buildGroup(
+      source,
+      [
+        for (final item in adjustments)
+          if (item.id != adjustment.id) item,
+        adjustment,
+      ],
+    );
   }
 
   static Map<Currency, PositionState> calculatePositionStates(
@@ -212,6 +286,7 @@ class FxEngine {
         'from_amount',
         'to_currency',
         'to_amount',
+        'adjustment_of',
         'comment',
       ],
       for (final operation in sortOperations(operations))
@@ -222,6 +297,7 @@ class FxEngine {
           _csvNumber(operation.fromAmount),
           operation.toCurrency.code,
           _csvNumber(operation.toAmount),
+          operation.adjustmentSourceId ?? '',
           operation.comment,
         ],
     ];
@@ -240,6 +316,7 @@ class FxEngine {
     final toAmountIndex = header.indexOf('to_amount');
     final fromIndex = header.indexOf('from');
     final toIndex = header.indexOf('to');
+    final adjustmentIndex = header.indexOf('adjustment_of');
     final commentIndex = header.indexOf('comment');
     final hasExpandedMoney =
         fromCurrencyIndex != -1 &&
@@ -280,6 +357,7 @@ class FxEngine {
         fromAmount: from.amount,
         toCurrency: to.currency,
         toAmount: to.amount,
+        adjustmentSourceId: _emptyToNull(cell(adjustmentIndex).trim()),
         comment: commentIndex == -1 ? '' : cell(commentIndex),
       );
       final validation = validateOperation(operation);
@@ -290,6 +368,79 @@ class FxEngine {
     final ledgerError = validateLedger(operations);
     if (ledgerError != null) throw FormatException(ledgerError);
     return operations;
+  }
+
+  static WalletOperationGroup _buildGroup(
+    WalletOperation source,
+    List<WalletOperation> adjustments,
+  ) {
+    final sortedAdjustments = sortOperations(adjustments);
+    var removedFrom = 0.0;
+    var removedTo = 0.0;
+    for (final adjustment in sortedAdjustments) {
+      removedFrom += adjustment.toAmount;
+      removedTo += adjustment.fromAmount;
+    }
+    return WalletOperationGroup(
+      source: source,
+      adjustments: sortedAdjustments,
+      netFromAmount: _zero(source.fromAmount - removedFrom),
+      netToAmount: _zero(source.toAmount - removedTo),
+    );
+  }
+
+  static void _validateAdjustmentLinks(List<WalletOperation> operations) {
+    final byId = <String, WalletOperation>{};
+    for (final operation in operations) {
+      if (byId.containsKey(operation.id)) {
+        throw StateError('Дублируется операция ${operation.id}.');
+      }
+      byId[operation.id] = operation;
+    }
+
+    final removedBySource = <String, ({double from, double to})>{};
+    for (final operation in operations) {
+      final sourceId = operation.adjustmentSourceId;
+      if (sourceId == null) continue;
+      if (sourceId == operation.id) {
+        throw StateError('Корректировка не может ссылаться на себя.');
+      }
+      final source = byId[sourceId];
+      if (source == null) {
+        throw StateError('Корректировка ссылается на удаленную операцию.');
+      }
+      if (source.isAdjustment) {
+        throw StateError('Корректировка не может ссылаться на корректировку.');
+      }
+      if (operation.occurredAt.isBefore(source.occurredAt) ||
+          (operation.occurredAt == source.occurredAt &&
+              operation.id.compareTo(source.id) <= 0)) {
+        throw StateError('Корректировка должна идти после исходной операции.');
+      }
+      if (operation.fromCurrency != source.toCurrency ||
+          operation.toCurrency != source.fromCurrency) {
+        throw StateError('Корректировка должна быть обратной операции.');
+      }
+      final expectedTo = operation.fromAmount * source.fromAmount /
+          source.toAmount;
+      if (!_close(operation.toAmount, expectedTo)) {
+        throw StateError('Суммы корректировки не совпадают с курсом операции.');
+      }
+      final current = removedBySource[sourceId] ?? (from: 0.0, to: 0.0);
+      removedBySource[sourceId] = (
+        from: current.from + operation.toAmount,
+        to: current.to + operation.fromAmount,
+      );
+    }
+
+    for (final entry in removedBySource.entries) {
+      final source = byId[entry.key]!;
+      final removed = entry.value;
+      if (removed.from >= source.fromAmount - tolerance ||
+          removed.to >= source.toAmount - tolerance) {
+        throw StateError('Корректировки полностью убирают операцию.');
+      }
+    }
   }
 
   static Map<int, EurUsdRangeStats> calculateRanges(List<RatePoint> history) {
@@ -363,6 +514,8 @@ class FxEngine {
   static bool _isPositiveFinite(double value) =>
       value.isFinite && value > tolerance;
 
+  static bool _close(double a, double b) => (a - b).abs() <= tolerance;
+
   static double _zero(double value) => value.abs() <= tolerance ? 0 : value;
 
   static String _csvNumber(double value) {
@@ -430,6 +583,8 @@ class FxEngine {
     }
     return value;
   }
+
+  static String? _emptyToNull(String value) => value.isEmpty ? null : value;
 
   static MoneyAmount _parseCompactMoney(String raw) {
     final parts = raw.trim().split(RegExp(r'\s+'));

@@ -17,6 +17,8 @@ enum Currency {
   }
 }
 
+const Object _unchangedAdjustmentSourceId = Object();
+
 class MoneyAmount {
   const MoneyAmount({required this.currency, required this.amount});
 
@@ -57,6 +59,7 @@ class WalletOperation {
     required this.toCurrency,
     required this.toAmount,
     this.comment = '',
+    this.adjustmentSourceId,
   }) : id = id ?? DateTime.now().microsecondsSinceEpoch.toString();
 
   final String id;
@@ -66,6 +69,9 @@ class WalletOperation {
   final Currency toCurrency;
   final double toAmount;
   final String comment;
+  final String? adjustmentSourceId;
+
+  bool get isAdjustment => adjustmentSourceId != null;
 
   WalletOperation copyWith({
     String? id,
@@ -75,6 +81,7 @@ class WalletOperation {
     Currency? toCurrency,
     double? toAmount,
     String? comment,
+    Object? adjustmentSourceId = _unchangedAdjustmentSourceId,
   }) {
     return WalletOperation(
       id: id ?? this.id,
@@ -84,8 +91,33 @@ class WalletOperation {
       toCurrency: toCurrency ?? this.toCurrency,
       toAmount: toAmount ?? this.toAmount,
       comment: comment ?? this.comment,
+      adjustmentSourceId:
+          identical(adjustmentSourceId, _unchangedAdjustmentSourceId)
+          ? this.adjustmentSourceId
+          : adjustmentSourceId as String?,
     );
   }
+}
+
+class WalletOperationGroup {
+  const WalletOperationGroup({
+    required this.source,
+    required this.adjustments,
+    required this.netFromAmount,
+    required this.netToAmount,
+  });
+
+  final WalletOperation source;
+  final List<WalletOperation> adjustments;
+  final double netFromAmount;
+  final double netToAmount;
+
+  bool get hasAdjustments => adjustments.isNotEmpty;
+
+  WalletOperation get netOperation => source.copyWith(
+    fromAmount: netFromAmount,
+    toAmount: netToAmount,
+  );
 }
 
 class WalletPosition {
