@@ -60,6 +60,8 @@ class LocalStore {
     'toCurrency': operation.toCurrency.code,
     'toAmount': operation.toAmount,
     'comment': operation.comment,
+    if (operation.adjustmentSourceId != null)
+      'adjustmentSourceId': operation.adjustmentSourceId,
   };
 
   WalletOperation _operationFromJson(Map<String, dynamic> json) {
@@ -71,6 +73,7 @@ class LocalStore {
       toCurrency: Currency.parse(json['toCurrency'] as String),
       toAmount: (json['toAmount'] as num).toDouble(),
       comment: json['comment'] as String? ?? '',
+      adjustmentSourceId: json['adjustmentSourceId'] as String?,
     );
   }
 
